@@ -119,21 +119,36 @@ Cross-facet expansion must prevent "over-suppression" where a user's answer inap
 
 ### Safety Rules
 
+The following rules represent the **Relaxed (LLM-ready)** safety logic, which is the current system default. These heuristics filter out obvious mismatches before they reach the LLM. Strict numeric logic is considered legacy behavior.
+
 | Rule | Logic | Protects Against |
 |------|-------|------------------|
 | **Source Priority** | Target facet is already in user's profile | **Intra-Facet Integrity**: Prevents corrupting single-select answers or overriding explicit user choices with inferred ones |
 | **Single→Multi** | If user has **only** single-select sources in a cluster, **EXCLUDE** expansion to multi-select targets. If user has **any** multi-select source, allow expansion to all target types. | User losing ability to select multiple options (while allowing expansion when user has already committed to multi-select) |
 | **Coverage Check** | If target facet has values NOT in the cluster (`fc=0`), **EXCLUDE** expansion | Over-suppression of unique answer options |
+| **Adaptive Index Stripping** | Mismatches caused solely by survey indices (e.g., "1. Yes" vs "2. Yes") are ignored if the remainder matches. | Prevents false rejections due to index pollution. |
+| **One-Sided Numeric Deferral** | If only one side contains numbers, the safety guard defers to the LLM. | Allows semantic matching for "5 Years" vs "Varies by Year". |
 
 ### Skip Propagation
 
-When a user skips a question (`facet_value_id = -1`, "Doesn't apply to me"):
-1. `FacetHash` looks up `f2c:{prefix}:{facet_id}` to get ALL clusters for that facet
-2. ALL facets in those clusters receive the skip value (-1)
-3. **Skips BYPASS all safety rules** - if user says "doesn't apply", equivalent questions are also skipped
+When a user skips a question, a skip sentinel value (negative integer) is stored in their profile. These values identify the skip reason:
+
+| Skip Value | Meaning | Propagates? |
+|------------|---------|-------------|
+| `-1` | **Does Not Apply** | **YES** |
+| `-2` | Broken Question | No |
+| `-3` | Translation Error | No |
+| `-4` | Sensitive Content | No |
+| `-5` | Other/General Skip | No |
+
+**Propagation Logic:**
+1. `FacetHash` looks up `f2c:{prefix}:{facet_id}` to get ALL clusters for the skipped facet.
+2. If the skip value is `-1` (Does Not Apply), ALL facets in those clusters receive the skip value.
+3. **Skips BYPASS all safety rules** - if user says a concept "doesn't apply", equivalent questions are also skipped.
+4. Other skip reasons (`-2` through `-5`) are question-specific and do NOT propagate.
 
 > [!IMPORTANT]
-> Skips use the `f2c` key (facet → all clusters) instead of `fv2c` (value → cluster) because value `-1` doesn't have its own cluster membership.
+> Skips use the `f2c` key (facet → all clusters) instead of `fv2c` (value → cluster) because the value `-1` doesn't have its own cluster membership.
 
 ## Virtual Location Facets
 
@@ -274,15 +289,25 @@ These logs are stored under `CACHE_ROOT/debug/[TIMESTAMP]/` for permanent record
 
 For large clusters (>20,000 unique answers), the system switches from embedding similarity to string distance matching using `rapidfuzz`. This optimizes performance for true location clusters while preserving semantic matching for categorical questions.
 
+**Thresholds:**
+- **String similarity ≥90%**: Sent to LLM for validation.
+- **String similarity <90%**: Rejected immediately (prevents LLM hallucinations on similar-sounding names).
+
 | CLI Flag | Default | Purpose |
 |----------|---------|----------|
 | `--cache-db` | - | Path to SQLite cache database for embeddings, clusters, and LLM results |
+| `--clear-cache` | - | Clear cache and start fresh |
+| `--model` | `gpt-4o-mini` | Model override for LLM validation |
+| `--batch-size` | 20 | Pairs per LLM batch request |
+| `--concurrency` | 10 | Max concurrent LLM requests |
 | `--string-search-threshold` | 20000 | Threshold to switch to string search |
-| `--stop-before-llm-validation` | - | Exit script immediately after Question Classification and Answer Candidate collection (Phase 2), but before LLM validation (Phase 3). |
+| `--stop-before-llm-validation` | - | Exit script immediately after Phase 2, but before Phase 3 LLM validation. |
 | `--dump-question-classifications` | - | Path to CSV for question classifications debug output |
-| `--detect-cached-orphans` | - | Enable proactive detection and eviction of cached orphans; see Orphan Handling (Auto-Blacklist) section. |
-| `--relaxed-guards` | - | Relax safety guards (Subset, Numeric Weak, Structure). Default matches LLM mode. |
-| `--max-retries` | 3 | Max retry attempts for LLM rate limits or orphan handling retry loop |
+| `--detect-cached-orphans` | - | Enable proactive detection/eviction of cached orphans. |
+| `--prune-ghosts` | - | Prune "ghost" questions from cache that are no longer in input. |
+| `--json-logs` | - | Output logs in JSON format for structured logging |
+| `--stats-json` | - | Path to output Diagnostics result as JSON file |
+| `--max-cost` | - | Safety guardrail: abort if estimated cost exceeds this value |
 
 **Threshold rationale:**
 - Non-location clusters (industry, occupation, workplace) max out around 8-18K unique texts
@@ -314,6 +339,7 @@ Handles survey answers that differ only by enumeration (e.g., "1. Yes" vs "Yes",
     *   **Two-Sided (Adaptive)**: If *both* have indices ("1. Yes" vs "2. Yes"), they are stripped and the *remainders* are compared.
     *   **Safe Match**: If stripping reveals identical content ("Yes" == "Yes"), the match is **ACCEPTED**, effectively ignoring the conflicting indices (1 vs 2).
     *   **Safety Guards**: Stripped text must be meaningful (≥ 2 chars, or ≥ 1 for CJK). Numeric protection rules still apply to the *remainders*.
+*   **One-Sided Deferral**: When one side contains numbers and the other does not (after index stripping), the numeric guard is bypassed and validation is deferred to the LLM to handle semantic variations like "5" vs "Five".
 
 
 **2. Complex Script Handling (Unicode Category Filtering)**
@@ -334,7 +360,7 @@ To prevent false positives in high-volume "location list" questions (where deter
 *   **Logic**:
     *   **YES (Location)**: "Does this question ask for a specific geographic location (City, County)?" -> **Force String Search Mode** (still validated by LLM).
     *   **NO (Other)**: All other questions (Job Title, Industry, Demographics). -> **Standard** (Embeddings or String Search depending on size).
-*   **CLI Flag**: `--classify-questions` (enabled by default). Use `--no-classify-questions` to disable.
+*   **Always Enabled**: Question Classification is critical for system integrity and cannot be disabled.
 *   **Result**: Location questions use `rapidfuzz` string matching regardless of cluster size, optimized for finding candidates in large lists, then verified by LLM.
 
 ### Cluster Splitting (Algorithm Downgrade Prevention)
@@ -393,13 +419,13 @@ This makes full resyncs **self-healing**—they clean up historical orphans auto
 
 ### Orphan Tracking Database
 
-In addition to the auto-blacklist mechanism, the system maintains a persistent record of orphans in the `answer_unification_orphans` table for admin review and debugging.
+The system maintains a persistent record of orphans in the `answer_unification_orphans` table (PostgreSQL) for admin review and remediation. This replaces the ephemeral `orphan_ids.txt` file as the primary source of truth for supply health.
 
 **Schema:**
-- `facet_id`: The question ID (for high-level grouping).
+- `facet_id`: The question ID.
 - `facet_value_id`: The specific answer ID that failed clustering.
 - `new_country_id` / `language_id`: Locale context.
-- `cluster_failure_reason`: Why it failed (e.g., `no_candidates`, `llm_rejection`).
+- `cluster_failure_reason`: Reason code (e.g., `no_candidates`, `llm_rejection`).
 
 **Management Rake Tasks:**
 - `rake answer_unification:backfill_orphans_db[locale]`: Backfills the table by comparing active FacetValues vs. AnswerClusters.
@@ -413,7 +439,8 @@ Over time, questions may be removed from the input dataset but remain in the SQL
 
 *   **Logic**: Identifies questions in `top_levels` (cluster map) that are NOT present in the current input DataFrame.
 *   **Action**: Removes these keys from the cache.
-*   **CLI Flag**: `--prune-ghosts` (optional, can be run alongside other modes).
+*   **Automatic Trigger**: Automatically enabled during standard **Weekly Full Sync** operations.
+*   **CLI Flag**: `--prune-ghosts` (optional for manual runs).
 
 **Standard Facet Flagship Priority:**
 
@@ -528,6 +555,24 @@ The `AnswerUnificationWorker` includes automatic cleanup of stale Redis keys:
 - **`seed_cache`**: "Mark and Sweep" - deletes fv2c keys not in current clusters
 - **`update_cache_incremental`**: "Track and Purge" - removes orphaned fv2c keys
 - **`reset_question_clusters(clear_redis: true)`**: Clears all fv2c/c2fvs/c2fids keys
+
+## Scheduled Maintenance
+
+To ensure long-term health and cache hygiene, the system runs on a strict schedule:
+
+### Weekly Full Sync (Deep Clean)
+**Schedule**: Every Sunday at 04:00 UTC
+**Purpose**:
+1.  **Full Re-sync**: Re-evaluates all clusters from scratch.
+2.  **Ghost Pruning**: Removes "ghost questions" from the cache that are no longer present in the source data. Triggered via `--prune-ghosts`.
+3.  **Proactive Orphan Detection**: Identifies and evicts cached orphans that previously failed validation. Triggered via `--detect-cached-orphans`.
+4.  **Database Maintenance**: Runs `VACUUM` on the SQLite cache database to reclaim space and optimize performance.
+
+### Hourly Sync
+**Schedule**: Hourly
+**Purpose**:
+- Incremental updates for new questions/answers.
+- Rapid integration of new supply partners.
 
 ## Troubleshooting
 
@@ -693,7 +738,14 @@ Candidates are generated within each cluster using the appropriate strategy:
 
 ### Phase 3: Validation
 Evaluating candidates is expensive, so only survivors of Phase 2 reach the LLM.
+
 - **Model**: `gpt-4o-mini`
+- **Structured Prompt**: The LLM is guided by a specific set of equivalence categories to ensure consistency:
+    - **Translations**: "Yes" / "Sí"
+    - **Abbreviations**: "NYC" / "New York City"
+    - **Instructional Variations**: "Other" / "Other (please specify)"
+    - **Synonyms**: "Automobile Loan" / "Auto Loan"
+    - **Parenthetical Clarification**: "Education" / "Education (K-12)"
 - **Output**: Strict `YES` or `NO` decision.
 - **Caching**: Decisions are cached in SQLite to minimize costs on future runs.
 - **Auto-Blacklist & Retry**: If a question consistently fails validation against its cluster peers, it is flagged as an **Orphan**. The system automatically blacklists the bad cluster link and retries clustering (Phase 1) within the same run to find a better home.
