@@ -306,13 +306,15 @@ For large clusters (>20,000 unique answers), the system switches from embedding 
 
 To ensure consistent matching across varied inputs while preventing data destruction, the system applies valid normalization heuristics:
 
-**1. Leading Index Stripping**
-Handles survey answers that differ only by enumeration (e.g., "1. Yes" vs "Yes").
+**1. Leading Index Stripping (Adaptive)**
+Handles survey answers that differ only by enumeration (e.g., "1. Yes" vs "Yes", or "1. Yes" vs "2. Yes").
 *   **Logic**: Uses a regex `^\s*[(\（\[［]?\d+\s*(([.\-:．：－–—\u2212])(?!\s*\d)|[\)）\]］])[.\s]*` to identify indices.
-*   **Safety**:
-    *   **XOR Guard**: Stripping is ONLY applied if exactly one side has an index. If both have indices ("1. Yes" vs "2. Yes"), they are preserved to prevent merging distinct options.
-    *   **Meaningful Remainder**: Stripped text must be ≥ 2 characters.
-    *   **Numeric Protection**: Negative lookahead `(?!\s*\d)` prevents stripping decimals, ranges, or times (e.g., "3.5mm", "1 - 5", "１．５", "１：３０", "1−5" are NOT stripped).
+*   **Adaptive Strategy**:
+    *   **One-Sided**: If only one side has an index ("1. Yes" vs "Yes"), stripping is attempted.
+    *   **Two-Sided (Adaptive)**: If *both* have indices ("1. Yes" vs "2. Yes"), they are stripped and the *remainders* are compared.
+    *   **Safe Match**: If stripping reveals identical content ("Yes" == "Yes"), the match is **ACCEPTED**, effectively ignoring the conflicting indices (1 vs 2).
+    *   **Safety Guards**: Stripped text must be meaningful (≥ 2 chars, or ≥ 1 for CJK). Numeric protection rules still apply to the *remainders*.
+
 
 **2. Complex Script Handling (Unicode Category Filtering)**
 For CJK and Complex Scripts (Arabic, Hebrew, Thai, Indic), standard "romanization" (unidecode) is dangerous because it causes collisions (e.g., "Fukuoka" and "Tomioka" sharing a romanization) or destroys meaning (stripping Thai tone marks).
@@ -405,12 +407,26 @@ In addition to the auto-blacklist mechanism, the system maintains a persistent r
 
 **CLI Flag**: `--detect-cached-orphans` (default: enabled on full_resync)
 
+### Ghost Pruning (Cache Maintenance)
+
+Over time, questions may be removed from the input dataset but remain in the SQLite cache ("ghost questions"). To prevent cache bloat and potential interference:
+
+*   **Logic**: Identifies questions in `top_levels` (cluster map) that are NOT present in the current input DataFrame.
+*   **Action**: Removes these keys from the cache.
+*   **CLI Flag**: `--prune-ghosts` (optional, can be run alongside other modes).
+
 **Standard Facet Flagship Priority:**
 
 Standard facets (category 1, e.g., Education, Income, Occupation) receive special protection to ensure they anchor their clusters:
 
-1. **Flagship Status**: Standard facet questions are always marked as flagships
-2. **No Inbound Linking**: Standard facets never link to existing non-standard clusters
+1. **Flagship Status**: 
+    - **Standard Facets (Category 1)**: Core demographics (Age, Gender).
+    - **TheoremReach Standard (Category 100)**: TR-specific standard questions.
+    - Both categories are prioritized as "Flagships".
+2. **Selection Logic**:
+    - If a cluster contains Flagships, the one with the **Lowest Internal Question ID** is elected as the Representative.
+    - This ensures stability and prefers older/canonical question versions.
+3. **No Inbound Linking**: Standard facets never link to existing non-standard clusters
 3. **Blacklist Protection**: Standard facets are never blacklisted even if validation fails
 4. **Attract Non-Standard**: Non-standard questions CAN link to standard facet clusters
 
@@ -433,6 +449,20 @@ Large clusters are vulnerable to becoming "Garbage Bins" where semantically unre
 6. The retry loop re-clusters evicted questions with their blacklist in place
 7. **Efficiency**: Answer samples are generated only for the subset of questions involved in the audit, ensuring performance scales with audit size ($O(N_{audited})$) rather than total dataset size ($O(N_{total})$).
 8. **Cost Tracking**: LLM token usage and estimated costs are logged at the completion of the audit phase.
+
+**Audit Caching:**
+To reduce redundant LLM calls, stable clusters are cached based on their member composition:
+- A **hash** of sorted cluster member texts is computed for each cluster
+- Clusters with unchanged hash skip LLM audit entirely
+- When clusters have **0 evictions**, they are marked as stable and cached
+- When clusters have **evictions**, their cache is invalidated
+- Logs show `audit.cache_hit skipped_stable_clusters=N` for cache hits
+
+**Eviction Cooldown:**
+To prevent cascade churn, recently evicted questions are excluded from audit candidates:
+- Questions evicted within the last **24 hours** are identified via `evicted_at` timestamps
+- These questions are excluded from consideration, giving them time to settle into new clusters
+- Logs show `audit.cooldown_active questions=N` when cooldown is active
 
 **CLI Flags:**
 | Flag | Default | Purpose |
@@ -535,6 +565,9 @@ AnswerUnificationWorker.reset_question_clusters
 # Complete reset: clear SQLite cache AND PostgreSQL AnswerCluster records
 AnswerUnificationWorker.reset_question_clusters(clear_answer_clusters: true)
 
+# Force fresh LLM evaluation (after prompt changes)
+AnswerUnificationWorker.reset_question_clusters(clear_llm_decisions: true)
+
 # Nuclear option: clear everything including Redis
 AnswerUnificationWorker.reset_question_clusters(clear_exclusions: true, clear_answer_clusters: true, clear_redis: true)
 ```
@@ -543,6 +576,7 @@ AnswerUnificationWorker.reset_question_clusters(clear_exclusions: true, clear_an
 - `clear_exclusions` (default: `true`): Clears `cluster_exclusions` blacklist AND `AnswerUnificationOrphan` records
 - `clear_answer_clusters` (default: `false`): Clears PostgreSQL `AnswerCluster` records (affects InputExpander)
 - `clear_redis` (default: `false`): Clears all Redis fv2c/c2fvs/c2fids/f2c keys
+- `clear_llm_decisions` (default: `false`): Drops `llm_decisions` and `cluster_audit_history` tables to force fresh LLM evaluation (useful after prompt changes)
 
 Use when deploying new clustering logic (e.g., flagship facet protection) or fixing corrupted cluster assignments.
 
@@ -605,7 +639,7 @@ flowchart TD
             E_STAR -->|No| E_ALL[Compare All\nN*N]
             E_FLAG --> E_SIM[Dot Product]
             E_ALL --> E_SIM
-            E_SIM -->|Sim > 0.80| GUARDS
+            E_SIM -->|Sim > 0.70| GUARDS
         end
         
         subgraph SafetyGuards["Safety Guards"]
@@ -647,7 +681,9 @@ To prevent false positives between distinct entities (e.g., "Paris, TX" vs "Pari
 ### Phase 2: Candidate Generation
 Candidates are generated within each cluster using the appropriate strategy:
 - **String Search Mode**: Uses `rapidfuzz` (Levenshtein distance). Candidates must have >90% token sort ratio.
-- **Embedding Mode**: Uses cosine similarity of sentence embeddings. Candidates must have >0.80 similarity.
+- **Embedding Mode**: Uses cosine similarity of sentence embeddings.
+    - **Question threshold**: 0.80 (used for question clustering)
+    - **Answer threshold**: 0.70 default. **0.80** for CJK and Complex Script locales (language-specific tuning to reduce noise).
     - **Star Topology**: If a cluster contains a Standard Facet ("Flagship"), other questions are compared ONLY to the Flagship, reducing comparisons from O(N²) to O(N).
 
 **Safety Guards** are applied to all candidates to prevent dangerous merges:
@@ -661,4 +697,3 @@ Evaluating candidates is expensive, so only survivors of Phase 2 reach the LLM.
 - **Output**: Strict `YES` or `NO` decision.
 - **Caching**: Decisions are cached in SQLite to minimize costs on future runs.
 - **Auto-Blacklist & Retry**: If a question consistently fails validation against its cluster peers, it is flagged as an **Orphan**. The system automatically blacklists the bad cluster link and retries clustering (Phase 1) within the same run to find a better home.
-
