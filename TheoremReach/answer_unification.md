@@ -128,6 +128,7 @@ The following rules represent the **Relaxed (LLM-ready)** safety logic, which is
 | **Coverage Check** | If target facet has values NOT in the cluster (`fc=0`), **EXCLUDE** expansion | Over-suppression of unique answer options |
 | **Adaptive Index Stripping** | Mismatches caused solely by survey indices (e.g., "1. Yes" vs "2. Yes") are ignored if the remainder matches. | Prevents false rejections due to index pollution. |
 | **One-Sided Numeric Deferral** | If only one side contains numbers, the safety guard defers to the LLM. | Allows semantic matching for "5 Years" vs "Varies by Year". |
+| **Relaxed Guards (Standard)** | Structure Guard and Subset Guard (strict) are **DISABLED** by default. Subset Guard only rejects if length difference > 1 token. | Prevents false negatives on minor variations (e.g., "M" vs "M." or "US" vs "U.S."). |
 
 ### Skip Propagation
 
@@ -271,7 +272,7 @@ Check Rollbar for:
 ### Audit Logging
 During every production run (where `dry_run` is false), the system automatically generates and preserves human-readable audit logs in the debug directory:
 - `accepted_[LOCALE].csv`: Shows every match committed to the database with similarity scores and verdicts. Always created (header-only if empty).
-- `rejected_[LOCALE].csv`: Shows every pair blocked by structural guards or the LLM. Always created (header-only if empty).
+- `rejected_[LOCALE].csv`: Shows every pair blocked by structural guards or the LLM. **Note:** Low-value "THRESHOLD" rejections are filtered out by default to reduce noise. Always created (header-only if empty).
 - `candidates_[LOCALE].csv`: Shows ALL candidate pairs considered by the script before Phase 3 validation. Always preserved in both dry and live runs for end-to-end auditability. Always created (header-only if empty).
 - `question_clusters_[LOCALE].csv`: Shows the *final* effective clusters after splitting.
     - Columns: `original_q_cluster` (semantic group), `q_cluster` (split group), `is_location`, `question_text`.
@@ -728,7 +729,7 @@ Candidates are generated within each cluster using the appropriate strategy:
 - **String Search Mode**: Uses `rapidfuzz` (Levenshtein distance). Candidates must have >90% token sort ratio.
 - **Embedding Mode**: Uses cosine similarity of sentence embeddings.
     - **Question threshold**: 0.80 (used for question clustering)
-    - **Answer threshold**: 0.70 default. **0.80** for CJK and Complex Script locales (language-specific tuning to reduce noise).
+    - **Answer threshold**: 0.70 default. **0.80** for CJK and Complex Script locales (`zh`, `ja`, `ko`, `ar`, `he`, `th`, `hi`, etc.). This is language-specific tuning to reduce noise.
     - **Star Topology**: If a cluster contains a Standard Facet ("Flagship"), other questions are compared ONLY to the Flagship, reducing comparisons from O(N²) to O(N).
 
 **Safety Guards** are applied to all candidates to prevent dangerous merges:
@@ -744,8 +745,9 @@ Evaluating candidates is expensive, so only survivors of Phase 2 reach the LLM.
     - **Translations**: "Yes" / "Sí"
     - **Abbreviations**: "NYC" / "New York City"
     - **Instructional Variations**: "Other" / "Other (please specify)"
-    - **Synonyms**: "Automobile Loan" / "Auto Loan"
-    - **Parenthetical Clarification**: "Education" / "Education (K-12)"
+    - **Synonyms**: "Automobile Loan" / "Auto Loan", "Greek Yogurt" / "Greek Yogurt (Strained)"
+    - **Rewording**: "Employed full-time" / "Full-time employment"
+    - **Punctuation/Spacing**: "Part-time" / "Part time"
 - **Output**: Strict `YES` or `NO` decision.
 - **Caching**: Decisions are cached in SQLite to minimize costs on future runs.
 - **Auto-Blacklist & Retry**: If a question consistently fails validation against its cluster peers, it is flagged as an **Orphan**. The system automatically blacklists the bad cluster link and retries clustering (Phase 1) within the same run to find a better home.
