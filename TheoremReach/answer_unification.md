@@ -119,16 +119,17 @@ Cross-facet expansion must prevent "over-suppression" where a user's answer inap
 
 ### Safety Rules
 
-The following rules represent the **Relaxed (LLM-ready)** safety logic, which is the current system default. These heuristics filter out obvious mismatches before they reach the LLM. Strict numeric logic is considered legacy behavior.
+To maintain data integrity and user trust, the system enforces strict safeguards during the expansion process. These rules are applied in real-time to prevent expansions that logic or schema differences would make invalid.
+
+### Runtime Expansion Safeguards (Ruby)
+
+These rules apply **at query time** inside `FacetHash` to prevent unsafe expansions for specific users.
 
 | Rule | Logic | Protects Against |
 |------|-------|------------------|
 | **Source Priority** | Target facet is already in user's profile | **Intra-Facet Integrity**: Prevents corrupting single-select answers or overriding explicit user choices with inferred ones |
 | **Single→Multi** | If user has **only** single-select sources in a cluster, **EXCLUDE** expansion to multi-select targets. If user has **any** multi-select source, allow expansion to all target types. | User losing ability to select multiple options (while allowing expansion when user has already committed to multi-select) |
-| **Coverage Check** | If target facet has values NOT in the cluster (`fc=0`), **EXCLUDE** expansion | Over-suppression of unique answer options |
-| **Adaptive Index Stripping** | Mismatches caused solely by survey indices (e.g., "1. Yes" vs "2. Yes") are ignored if the remainder matches. | Prevents false rejections due to index pollution. |
-| **One-Sided Numeric Deferral** | If only one side contains numbers, the safety guard defers to the LLM. | Allows semantic matching for "5 Years" vs "Varies by Year". |
-| **Relaxed Guards (Standard)** | Structure Guard and Subset Guard (strict) are **DISABLED** by default. Subset Guard only rejects if length difference > 1 token. | Prevents false negatives on minor variations (e.g., "M" vs "M." or "US" vs "U.S."). |
+| **Schema Intersection** | If the Source Question's clusters do not cover *all* of the Target Question's clusters, **EXCLUDE** expansion. | Ensures Source Question schema is semantically equivalent or broader than Target Question schema. |
 
 ### Skip Propagation
 
@@ -144,9 +145,10 @@ When a user skips a question, a skip sentinel value (negative integer) is stored
 
 **Propagation Logic:**
 1. `FacetHash` looks up `f2c:{prefix}:{facet_id}` to get ALL clusters for the skipped facet.
-2. If the skip value is `-1` (Does Not Apply), ALL facets in those clusters receive the skip value.
-3. **Skips BYPASS all safety rules** - if user says a concept "doesn't apply", equivalent questions are also skipped.
-4. Other skip reasons (`-2` through `-5`) are question-specific and do NOT propagate.
+2. If the skip value is `-1` (Does Not Apply), the skip propagates to equivalent facets **that pass Schema Intersection check**.
+3. **Schema Intersection applies** - target facet's clusters must be a subset of source facet's clusters.
+4. **Single→Multi rule is NOT applied** - skip is a meta-signal, not a value that corrupts multi-select.
+5. Other skip reasons (`-2` through `-5`) are question-specific and do NOT propagate.
 
 > [!IMPORTANT]
 > Skips use the `f2c` key (facet → all clusters) instead of `fv2c` (value → cluster) because the value `-1` doesn't have its own cluster membership.
@@ -213,6 +215,7 @@ Expansion data is cached in Redis for O(1) read-time lookups with suppression sa
 **Field Legend:**
 - `t`: Source type (`s` = single-select, `m` = multi-select)
 - `fc`: Fully covered flag (`1` = all facet values are in cluster, `0` = some values excluded)
+  - Reserved for future optimization; currently unused. Schema Intersection via `f2c` is preferred.
 
 > [!NOTE]
 > We use **Packed JSON Strings** instead of Redis Sets (`SMEMBERS`) to allow fetching data for 100+ clusters in a single `MGET` command. This reduces the Redis Ops/Request from ~120 to ~3.
@@ -736,6 +739,15 @@ Candidates are generated within each cluster using the appropriate strategy:
 1.  **Numeric Guard**: Strips indices ("1. Yes") but protects values. Rejects if numbers differ (e.g., "2 years" vs "5 years").
 2.  **Subset Guard**: Ensures one answer isn't a superset of another (e.g., "100g" vs "100g (Pack of 3)").
 3.  **Structure Guard**: Checks for conflicting units or symbols (e.g., "$5" vs "5%").
+
+#### Safety Heuristics (Tuning)
+To balance precision and recall, these additional heuristics refine the strict guards during clustering:
+
+| Rule | Logic | Protects Against |
+|------|-------|------------------|
+| **Adaptive Index Stripping** | Mismatches caused solely by survey indices (e.g., "1. Yes" vs "2. Yes") are ignored if the remainder matches. | Prevents false rejections due to index pollution. |
+| **One-Sided Numeric Deferral** | If only one side contains numbers, the safety guard defers to the LLM. | Allows semantic matching for "5 Years" vs "Varies by Year". |
+| **Relaxed Guards (Standard)** | Structure Guard and Subset Guard (strict) are **DISABLED** by default. Subset Guard only rejects if length difference > 1 token. | Prevents false negatives on minor variations (e.g., "M" vs "M." or "US" vs "U.S."). |
 
 ### Phase 3: Validation
 Evaluating candidates is expensive, so only survivors of Phase 2 reach the LLM.
