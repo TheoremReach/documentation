@@ -558,7 +558,7 @@ Phase 1.5: Audit stabilized (improvement (8.2%) below threshold (10%)). Proceedi
 The `AnswerUnificationWorker` includes automatic cleanup of stale Redis keys:
 - **`seed_cache`**: "Mark and Sweep" - deletes fv2c keys not in current clusters
 - **`update_cache_incremental`**: "Track and Purge" - removes orphaned fv2c keys
-- **`reset_question_clusters(clear_redis: true)`**: Clears all fv2c/c2fvs/c2fids keys
+- **`reset_cache(clear_redis: true)`**: Clears all fv2c/c2fvs/c2fids keys
 
 ## Scheduled Maintenance
 
@@ -601,31 +601,56 @@ AnswerUnification::GenerateVirtualLocations.new(locale: 'en-US').execute
 AnswerUnificationWorker.run_maintenance  # Vacuums SQLite cache DBs
 ```
 
-### Reset Question Clusters Cache
-Forces all questions to be re-clustered on next full_resync. Preserves embeddings and LLM decisions.
+### Reset Cache (Targeted Cleanup)
+
+The `reset_cache` method provides flexible cache management for different deployment scenarios.
 
 ```ruby
+# After prompt changes: Clear LLM decisions + PostgreSQL clusters, keep question clusters
+# This is the recommended approach for prompt hardening deployments
+AnswerUnificationWorker.reset_cache(
+  clear_question_clusters: false,  # Keep expensive question clustering
+  clear_llm_decisions: true,       # Force fresh LLM evaluation
+  clear_exclusions: true,          # Clear stale blacklist
+  clear_answer_clusters: true      # CRITICAL: Clear Postgres to allow splits
+)
+
 # Clear question clusters only (preserves blacklist, orphans, and AnswerCluster records)
-AnswerUnificationWorker.reset_question_clusters(clear_exclusions: false)
+AnswerUnificationWorker.reset_cache(clear_exclusions: false)
 
 # Default: clear question clusters + blacklist + orphan tracking (recommended for fresh start)
-AnswerUnificationWorker.reset_question_clusters
+AnswerUnificationWorker.reset_cache
 
 # Complete reset: clear SQLite cache AND PostgreSQL AnswerCluster records
-AnswerUnificationWorker.reset_question_clusters(clear_answer_clusters: true)
+AnswerUnificationWorker.reset_cache(clear_answer_clusters: true)
 
 # Force fresh LLM evaluation (after prompt changes)
-AnswerUnificationWorker.reset_question_clusters(clear_llm_decisions: true)
+AnswerUnificationWorker.reset_cache(clear_llm_decisions: true)
 
-# Nuclear option: clear everything including Redis
-AnswerUnificationWorker.reset_question_clusters(clear_exclusions: true, clear_answer_clusters: true, clear_redis: true)
+# Force fresh question classification (after classification prompt changes)
+AnswerUnificationWorker.reset_cache(clear_classifications: true)
+
+# Nuclear option: clear everything including Redis and classifications
+AnswerUnificationWorker.reset_cache(
+  clear_question_clusters: true,
+  clear_llm_decisions: true,
+  clear_exclusions: true,
+  clear_answer_clusters: true,
+  clear_redis: true,
+  clear_classifications: true
+)
 ```
 
 **Parameters:**
-- `clear_exclusions` (default: `true`): Clears `cluster_exclusions` blacklist AND `AnswerUnificationOrphan` records
-- `clear_answer_clusters` (default: `false`): Clears PostgreSQL `AnswerCluster` records (affects InputExpander)
-- `clear_redis` (default: `false`): Clears all Redis fv2c/c2fvs/c2fids/f2c keys
-- `clear_llm_decisions` (default: `false`): Drops `llm_decisions` and `cluster_audit_history` tables to force fresh LLM evaluation (useful after prompt changes)
+- `clear_question_clusters` (default: `true`): Clears `question_clusters` table. Set to `false` to preserve expensive clustering work.
+- `clear_llm_decisions` (default: `false`): Clears `llm_decisions` and `cluster_audit_history` tables to force fresh LLM evaluation (useful after prompt changes).
+- `clear_exclusions` (default: `true`): Clears `cluster_exclusions` blacklist AND `AnswerUnificationOrphan` records.
+- `clear_answer_clusters` (default: `false`): Truncates PostgreSQL `AnswerCluster` records. Required when splitting clusters to prevent re-merging.
+- `clear_redis` (default: `false`): Clears all Redis fv2c/c2fvs/c2fids/f2c keys.
+- `clear_classifications` (default: `false`): Clears `question_classifications` table to force fresh LLM classification of questions.
+
+> [!NOTE]
+> The legacy `reset_question_clusters` method is deprecated but still available for backward compatibility. It delegates to `reset_cache` and emits a deprecation warning.
 
 Use when deploying new clustering logic (e.g., flagship facet protection) or fixing corrupted cluster assignments.
 
