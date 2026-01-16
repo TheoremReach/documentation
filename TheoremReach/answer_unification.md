@@ -207,8 +207,8 @@ Expansion data is cached in Redis for O(1) read-time lookups with suppression sa
 
 | Key | Type | Purpose |
 |-----|------|---------|
-| `fv2c:{cid}:{lid}:{fvid}` | JSON | FacetValueID → `{"c":"cluster_id","t":"s"|"m"}` (cluster + type) |
-| `f2c:{cid}:{lid}:{fid}` | JSON | FacetID → `{"c":["cid1",...],"t":"s"|"m"}` (all clusters for skip propagation) |
+| `fv2c:{cid}:{lid}:{fvid}` | JSON | FacetValueID → `{"c":[cid1, cid2],"t":"s"|"m"}` (Array of cluster IDs) |
+| `f2c:{cid}:{lid}:{fid}` | JSON | FacetID → `{"c":[cid1, cid2],"t":"s"|"m"}` (all cluster IDs for skip propagation) |
 | `c2fids:{cid}:{lid}:{cluster_id}` | JSON | ClusterID → FacetIDs (JSON Array) |
 | `c2fvs:{cid}:{lid}:{cluster_id}:{fid}` | JSON | Cluster+Facet → `{"v":[fvid,...],"t":"s"|"m","fc":0|1}` |
 
@@ -303,7 +303,7 @@ For large clusters (>20,000 unique answers), the system switches from embedding 
 | `--clear-cache` | - | Clear cache and start fresh |
 | `--model` | `gpt-4o-mini` | Model override for LLM validation |
 | `--batch-size` | 20 | Pairs per LLM batch request |
-| `--concurrency` | 10 | Max concurrent LLM requests |
+| `--concurrency` | 50 | Max concurrent LLM requests |
 | `--string-search-threshold` | 20000 | Threshold to switch to string search |
 | `--stop-before-llm-validation` | - | Exit script immediately after Phase 2, but before Phase 3 LLM validation. |
 | `--dump-question-classifications` | - | Path to CSV for question classifications debug output |
@@ -312,6 +312,8 @@ For large clusters (>20,000 unique answers), the system switches from embedding 
 | `--json-logs` | - | Output logs in JSON format for structured logging |
 | `--stats-json` | - | Path to output Diagnostics result as JSON file |
 | `--max-cost` | - | Safety guardrail: abort if estimated cost exceeds this value |
+| `--confidence-high` | 0.92 | Log suspicious LLM rejections above this threshold |
+| `--confidence-low` | - | Log borderline acceptances below this threshold |
 
 **Threshold rationale:**
 - Non-location clusters (industry, occupation, workplace) max out around 8-18K unique texts
@@ -482,12 +484,11 @@ Large clusters are vulnerable to becoming "Garbage Bins" where semantically unre
 8. **Cost Tracking**: LLM token usage and estimated costs are logged at the completion of the audit phase.
 
 **Audit Caching:**
-To reduce redundant LLM calls, stable clusters are cached based on their member composition:
-- A **hash** of sorted cluster member texts is computed for each cluster
-- Clusters with unchanged hash skip LLM audit entirely
-- When clusters have **0 evictions**, they are marked as stable and cached
-- When clusters have **evictions**, their cache is invalidated
-- Logs show `audit.cache_hit skipped_stable_clusters=N` for cache hits
+Individual audit decisions are cached to avoid redundant LLM calls:
+- Each `(question, representative)` pair's verdict is persisted in `llm_decisions`
+- Key format: `["AUDIT", question_text, representative_text]`
+- If a cluster's composition changes but a question was previously verified against the same representative, the cached decision is reused
+- Logs show `audit.decision_cache_hits=N` when decisions are served from cache
 
 **Eviction Cooldown:**
 To prevent cascade churn, recently evicted questions are excluded from audit candidates:
@@ -615,6 +616,13 @@ AnswerUnificationWorker.reset_cache(
   clear_answer_clusters: true      # CRITICAL: Clear Postgres to allow splits
 )
 
+# Then run full resync with ignore_existing_map to force re-evaluation
+AnswerUnificationWorker.new.perform(
+  full_resync: true,
+  ignore_existing_map: true,       # CRITICAL: Force re-evaluation of all pairs
+  dump_debug_files: true
+)
+
 # Clear question clusters only (preserves blacklist, orphans, and AnswerCluster records)
 AnswerUnificationWorker.reset_cache(clear_exclusions: false)
 
@@ -643,11 +651,14 @@ AnswerUnificationWorker.reset_cache(
 
 **Parameters:**
 - `clear_question_clusters` (default: `true`): Clears `question_clusters` table. Set to `false` to preserve expensive clustering work.
-- `clear_llm_decisions` (default: `false`): Clears `llm_decisions` and `cluster_audit_history` tables to force fresh LLM evaluation (useful after prompt changes).
+- `clear_llm_decisions` (default: `false`): Clears `llm_decisions` table to force fresh LLM evaluation (useful after prompt changes).
 - `clear_exclusions` (default: `true`): Clears `cluster_exclusions` blacklist AND `AnswerUnificationOrphan` records.
 - `clear_answer_clusters` (default: `false`): Truncates PostgreSQL `AnswerCluster` records. Required when splitting clusters to prevent re-merging.
-- `clear_redis` (default: `false`): Clears all Redis fv2c/c2fvs/c2fids/f2c keys.
+- `clear_redis` (default: `false`): Clears all Redis fv2c/c2fvs/c2fids/f2c keys. Generally not needed since ghost cleanup is automatic.
 - `clear_classifications` (default: `false`): Clears `question_classifications` table to force fresh LLM classification of questions.
+
+> [!NOTE]
+> When deploying prompt changes that could split existing clusters, use `ignore_existing_map: true` on `perform`. This passes an empty map to the Python script, forcing re-evaluation of all pairs while preserving `current_map.json` for ghost key cleanup.
 
 > [!NOTE]
 > The legacy `reset_question_clusters` method is deprecated but still available for backward compatibility. It delegates to `reset_cache` and emits a deprecation warning.
@@ -744,6 +755,16 @@ flowchart TD
     
     MATCH --> DB[(AnswerCluster)]
     BLACKLIST -.->|Retry| Q
+    
+    subgraph Phase4["Phase 4: Entailment (Multi-Cluster)"]
+        MATCH -->|Filter| REPS[Cluster Representatives]
+        REPS -->|Vector Search| OV_CAND[Overlap Candidates]
+        OV_CAND -->|LLM Check| OV_LLM{Does X entail Y?}
+        
+        OV_LLM -->|YES| OVERLAPS[overlaps.json]
+        
+        OVERLAPS --> READ_TIME[Redis: fv2c = [CID_X, CID_Y]] 
+    end
 ```
 
 ### Phase 1: Question Clustering
@@ -758,7 +779,8 @@ Candidates are generated within each cluster using the appropriate strategy:
 - **Embedding Mode**: Uses cosine similarity of sentence embeddings.
     - **Question threshold**: 0.80 (used for question clustering)
     - **Answer threshold**: 0.70 default. **0.80** for CJK and Complex Script locales (`zh`, `ja`, `ko`, `ar`, `he`, `th`, `hi`, etc.). This is language-specific tuning to reduce noise.
-    - **Star Topology**: If a cluster contains a Standard Facet ("Flagship"), other questions are compared ONLY to the Flagship, reducing comparisons from O(N²) to O(N).
+    - **Strict Centroid Clustering**: Questions are compared ONLY to the elected **Cluster Representative** (Flagship or Medoid), preventing "daisy-chain" topologies where A matches B and B matches C, but A != C.
+    - **Star Topology**: This O(N) comparison strategy ensures tight, consistent clusters anchored by a canonical text.
 
 **Safety Guards** are applied to all candidates to prevent dangerous merges:
 1.  **Numeric Guard**: Strips indices ("1. Yes") but protects values. Rejects if numbers differ (e.g., "2 years" vs "5 years").
@@ -778,13 +800,23 @@ To balance precision and recall, these additional heuristics refine the strict g
 Evaluating candidates is expensive, so only survivors of Phase 2 reach the LLM.
 
 - **Model**: `gpt-4o-mini`
-- **Structured Prompt**: The LLM is guided by a specific set of equivalence categories to ensure consistency:
-    - **Translations**: "Yes" / "Sí"
-    - **Abbreviations**: "NYC" / "New York City"
-    - **Instructional Variations**: "Other" / "Other (please specify)"
-    - **Synonyms**: "Automobile Loan" / "Auto Loan", "Greek Yogurt" / "Greek Yogurt (Strained)"
-    - **Rewording**: "Employed full-time" / "Full-time employment"
-    - **Punctuation/Spacing**: "Part-time" / "Part time"
+- **Structured Prompt**: The LLM is guided by a specific set of equivalence categories to ensure consistency.
+    - **Explicit Rejections**: Specifically rejects "Specificity Mismatch" (e.g., "Car" vs "Toyota") and **Composite vs Specific** (e.g., "Full-time/Part-time" vs "Full-time").
 - **Output**: Strict `YES` or `NO` decision.
 - **Caching**: Decisions are cached in SQLite to minimize costs on future runs.
 - **Auto-Blacklist & Retry**: If a question consistently fails validation against its cluster peers, it is flagged as an **Orphan**. The system automatically blacklists the bad cluster link and retries clustering (Phase 1) within the same run to find a better home.
+
+- **Goal**: Allow users with composite answers (e.g., "Full-time/Part-time") to qualify for surveys targeting specific components (e.g., "Full-time").
+- **Direction**: "Source -> Implied" (Unidirectional).
+    - If a user's answer (Source) implies another answer (Implied), they are logically eligible for surveys targeting either.
+    - Example: `Full-time/Part-time` (Source) entails `Full-time` (Implied).
+- **Process**:
+    1.  **Representatives**: After answer clustering, an **Answer Representative** is elected for each cluster. **Flagship Priority** is applied: if a cluster contains a Standard Answer (Category 1), it is prioritized; otherwise, the cluster medoid is used. Only these representatives are compared (O(N_clusters)).
+    2.  **Vector Search**: Finds candidates with high semantic overlap (using a loose threshold, e.g., 0.85).
+    3.  **LLM Verification**: Asks: "Does a user with answer '{Source}' qualify for a campaign targeting '{Implied}'?"
+    4.  **Batching**: Decisions are processed in async batches for performance and cached in SQLite.
+- **Consumption**: `AnswerUnificationWorker` reads `overlaps.json` and writes `fv2c` as an **Array** of Cluster IDs.
+    - `fv2c:{FT/PT_AnswerID}` -> `[ClusterID(FT/PT), ClusterID(FT), ClusterID(PT)]`.
+
+> [!NOTE]
+> **Overlaps are non-transitive (single-hop only).** If A entails B and B entails C, user A does NOT automatically match campaigns targeting C. This is intentional to prevent semantic explosion and overly broad matching.
